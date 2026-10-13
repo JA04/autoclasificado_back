@@ -11,13 +11,17 @@ from app.ingest import upsert_cars
 from app.models import Car
 from app.scraper import (
     V6_LISTING_URL,
+    V6_SITEMAP_URL,
     clean_number,
     clean_price,
+    infer_currency,
     parse_motordil_listing,
     parse_motordil_page_count,
-    parse_v6_detail_province,
+    parse_v6_detail,
     parse_v6_listing,
+    parse_v6_sitemap,
     scrape_motordil,
+    v6_canonical_url,
     scrape_v6,
     split_year,
 )
@@ -50,9 +54,23 @@ def test_clean_number():
     ("$ 35.000.000", (35000000, "ARS")),
     ("Consultar", (None, "USD")),
     (None, (None, "USD")),
+    # Sin moneda explícita se deduce por el monto
+    ("11.000", (11000, "USD")),
+    ("35.000.000", (35000000, "ARS")),
 ])
 def test_clean_price(text, expected):
     assert clean_price(text) == expected
+
+
+@pytest.mark.parametrize("amount, expected", [
+    (4300, "USD"),
+    (999_999, "USD"),
+    (1_000_000, "ARS"),
+    (35_000_000, "ARS"),
+    (None, "USD"),
+])
+def test_infer_currency(amount, expected):
+    assert infer_currency(amount) == expected
 
 
 @pytest.mark.parametrize("text, expected", [
@@ -142,7 +160,7 @@ def test_parse_v6_listing():
         "price": 49500000,
         "currency": "ARS",
         "province": "Córdoba",
-        "original_url": "https://v6.com.ar/auto/fiat-titano-ranch-4x4-2-2-at-4p-diesel-2026-PBfN31yK4Z",
+        "original_url": "https://v6.com.ar/auto/PBfN31yK4Z",
         "source_site": "v6",
     }
     # 'Ciudad De Buenos Aires' es una provincia; 'Olivos' es una localidad y queda sin resolver
@@ -152,13 +170,107 @@ def test_parse_v6_listing():
     assert cars[2]["province"] is None
 
 
-def test_parse_v6_detail_province():
-    assert parse_v6_detail_province(fixture("v6_detail.html")) == "Buenos Aires"
-    assert parse_v6_detail_province("<html><body>Vehículo no encontrado</body></html>") is None
-    assert parse_v6_detail_province('<script type="application/ld+json">{no es json</script>') is None
+@pytest.mark.parametrize("url", [
+    "https://v6.com.ar/auto/fiat-titano-2026-PBfN31yK4Z",
+    "https://www.v6.com.ar/auto/fiat-titano-ranch-4x4-2-2-at-4p-diesel-2026-PBfN31yK4Z/",
+    "/auto/fiat-titano-ranch-4x4-2-2-at-4p-diesel-2026-PBfN31yK4Z",
+    "https://v6.com.ar/auto/PBfN31yK4Z",
+])
+def test_v6_canonical_url(url):
+    assert v6_canonical_url(url) == "https://v6.com.ar/auto/PBfN31yK4Z"
 
 
-def test_scrape_v6_fills_province_from_detail():
+def test_parse_v6_sitemap():
+    xml = """<urlset>
+      <url><loc>https://v6.com.ar/autos-usados</loc></url>
+      <url><loc>https://v6.com.ar/auto/fiat-titano-2026-PBfN31yK4Z</loc></url>
+      <url><loc> https://v6.com.ar/auto/renault-sandero-2019-qOqNcbBjNw </loc></url>
+      <url><loc>https://v6.com.ar/auto/fiat-titano-2026-PBfN31yK4Z</loc></url>
+      <url><loc>https://v6.com.ar/autos/toyota</loc></url>
+    </urlset>"""
+    assert parse_v6_sitemap(xml) == [
+        "https://v6.com.ar/auto/fiat-titano-2026-PBfN31yK4Z",
+        "https://v6.com.ar/auto/renault-sandero-2019-qOqNcbBjNw",
+    ]
+    assert parse_v6_sitemap("") == []
+
+
+def test_parse_v6_detail_with_currency():
+    # La publicación declara USD aunque sus datos schema.org digan ARS
+    assert parse_v6_detail(fixture("v6_detail_usd.html"), "https://v6.com.ar/auto/renault-sandero-2019-qOqNcbBjNw") == {
+        "title": "Renault Sandero II RS 2.0 16v MT 5P",
+        "year": 2019,
+        "mileage": 58358,
+        "price": 14500,
+        "currency": "USD",
+        "province": "Capital Federal",
+        "original_url": "https://v6.com.ar/auto/qOqNcbBjNw",
+        "source_site": "v6",
+    }
+
+
+def test_parse_v6_detail_infers_currency_when_missing():
+    # Esta publicación no trae moneda: 35.000.000 se toma como pesos
+    car = parse_v6_detail(fixture("v6_detail_ars.html"), "https://v6.com.ar/auto/toyota-corolla-2022-Pl5OiYf76B")
+    assert car["title"] == "Toyota Corolla HEV SEG 1.8 eCVT 4P"
+    assert (car["price"], car["currency"]) == (35000000, "ARS")
+    assert (car["year"], car["mileage"], car["province"]) == (2022, 62500, "Buenos Aires")
+
+
+def test_parse_v6_detail_falls_back_to_structured_data():
+    # Fixture sin los datos de la app: quedan solo los de schema.org, que dicen
+    # "ARS 11000". Por el monto se corrige a USD.
+    assert parse_v6_detail(fixture("v6_detail.html"), "https://v6.com.ar/auto/ford-focus-2014-JWSQCI8RKw") == {
+        "title": "Ford Focus SE Plus 2.0 MT 5P",
+        "year": 2014,
+        "mileage": 119000,
+        "price": 11000,
+        "currency": "USD",
+        "province": "Buenos Aires",
+        "original_url": "https://v6.com.ar/auto/JWSQCI8RKw",
+        "source_site": "v6",
+    }
+
+
+def test_parse_v6_detail_without_data():
+    assert parse_v6_detail("<html><body>Vehículo no encontrado</body></html>", "https://v6.com.ar/auto/x") is None
+    assert parse_v6_detail('<script type="application/ld+json">{no es json</script>', "https://v6.com.ar/auto/x") is None
+
+
+def test_scrape_v6_reads_every_sitemap_listing():
+    sitemap = """<urlset>
+      <url><loc>https://v6.com.ar/auto/renault-sandero-2019-qOqNcbBjNw</loc></url>
+      <url><loc>https://v6.com.ar/auto/toyota-corolla-2022-Pl5OiYf76B</loc></url>
+      <url><loc>https://v6.com.ar/auto/dado-de-baja-2010-XXXXXXXXXX</loc></url>
+    </urlset>"""
+    requested = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requested.append(url)
+        if url == V6_SITEMAP_URL:
+            return httpx.Response(200, text=sitemap)
+        if "sandero" in url:
+            return httpx.Response(200, text=fixture("v6_detail_usd.html"))
+        if "corolla" in url:
+            return httpx.Response(200, text=fixture("v6_detail_ars.html"))
+        return httpx.Response(404)
+
+    cars = scrape_v6(mock_client(handler), delay=0)
+
+    assert [(car["title"], car["currency"]) for car in cars] == [
+        ("Renault Sandero II RS 2.0 16v MT 5P", "USD"),
+        ("Toyota Corolla HEV SEG 1.8 eCVT 4P", "ARS"),
+    ]
+    assert len(requested) == 4
+    assert V6_LISTING_URL not in requested
+
+    requested.clear()
+    assert len(scrape_v6(mock_client(handler), delay=0, limit=1)) == 1
+    assert len(requested) == 2
+
+
+def test_scrape_v6_falls_back_to_listing_without_sitemap():
     requested = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -166,21 +278,21 @@ def test_scrape_v6_fills_province_from_detail():
         requested.append(url)
         if url == V6_LISTING_URL:
             return httpx.Response(200, text=fixture("v6_listing.html"))
-        if "ford-focus" in url:
+        if url.endswith("JWSQCI8RKw"):
             return httpx.Response(200, text=fixture("v6_detail.html"))
         return httpx.Response(404)
 
     cars = scrape_v6(mock_client(handler), delay=0)
 
     assert len(cars) == 9
-    focus = next(car for car in cars if "ford-focus" in car["original_url"])
+    focus = next(car for car in cars if car["original_url"].endswith("JWSQCI8RKw"))
     assert focus["province"] == "Buenos Aires"
     # Solo se piden las publicaciones cuya provincia no salió del listado
     assert cars[0]["original_url"] not in requested
-    assert sum(car["province"] is None for car in cars) == len(requested) - 2
+    assert requested[:2] == [V6_SITEMAP_URL, V6_LISTING_URL]
 
 
-def test_scrape_v6_returns_empty_when_listing_fails():
+def test_scrape_v6_returns_empty_when_site_is_down():
     assert scrape_v6(mock_client(lambda request: httpx.Response(500)), delay=0) == []
 
 

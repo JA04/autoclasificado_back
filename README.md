@@ -83,7 +83,7 @@ curl -i "http://localhost:8000/cars?q=corolla&province=cordoba&limit=24&offset=2
 make scrape                                        # todo, 1 página por provincia
 make scrape ARGS="--pages 3"                       # hasta 3 páginas por provincia en motordil
 make scrape ARGS="--site motordil --provinces cordoba,santa-fe"
-make scrape ARGS="--site v6"
+make scrape ARGS="--site v6 --v6-limit 20"         # solo v6, primeras 20 publicaciones
 ```
 
 Se puede correr todas las veces que haga falta: las publicaciones se identifican por
@@ -97,15 +97,26 @@ espera 1 segundo (`--delay`).
 La provincia sale de la URL. Si una publicación bajó de precio se guarda el precio
 vigente, no el tachado.
 
-**v6** — `v6.com.ar/autos-usados` trae en el HTML una lista de publicaciones con
-título, kilometraje, precio y localidad. Como la localidad no siempre es una provincia
-("Olivos"), en esos casos se abre la publicación y se lee la provincia de sus datos
-`schema.org`.
+**v6** — `v6.com.ar/autos-usados` solo trae una decena de publicaciones en el HTML,
+así que la lista completa se saca de su `sitemap.xml` y se abre cada publicación
+(unas 180, un request por cada una). Los datos salen de la información que la página
+le pasa a su propia app y, si falta, de sus datos `schema.org`. Si el sitemap no
+responde, se usa el listado de `/autos-usados`.
+
+v6 identifica cada publicación por el id del final de la URL e ignora el resto, así
+que se guarda siempre la forma `https://v6.com.ar/auto/{id}`.
+
+### Moneda
+
+Cuando la publicación dice la moneda (`USD`, `U$S`, `ARS`, `$`), se respeta. Cuando no
+la dice, se deduce por el monto: **menos de 1.000.000 es USD; desde ahí, ARS**. Pasa
+en cerca de un tercio de las publicaciones de v6; sus datos `schema.org` no sirven
+para esto porque declaran `ARS` siempre, incluso en autos publicados en dólares.
 
 ### Limitaciones conocidas
 
-- **v6 aporta pocas publicaciones** (9 en la última corrida). El resto del catálogo se
-  carga por JavaScript desde una API que su `robots.txt` no permite recorrer.
+- **Una corrida completa tarda unos 6 minutos**: son ~180 requests a v6 y 24 a
+  motordil, con 1 segundo de espera entre cada uno.
 - **motordil pesa ~2 MB por página.** Con `--pages 1` son 24 requests; Buenos Aires
   tiene más de 100 páginas, así que conviene subir `--pages` de a poco.
 - Las publicaciones que desaparecen de los portales no se borran de `cars.db`.
@@ -126,7 +137,7 @@ No salen a la red: los parsers se prueban contra HTML real guardado en
 ## Estructura
 
 ```text
-backend/
+autoclasificado_back/
 ├── app/
 │   ├── main.py        # API: GET /cars
 │   ├── models.py      # tabla cars (SQLAlchemy)

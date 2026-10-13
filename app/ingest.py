@@ -1,7 +1,7 @@
 """
 Ingesta: descarga las publicaciones de los portales y las guarda en la base de datos.
 
-Uso: python -m app.ingest [--site motordil|v6|all] [--pages N] [--provinces slug1,slug2]
+Uso: python -m app.ingest [--site motordil|v6|all] [--pages N] [--provinces slug1,slug2] [--v6-limit N]
 """
 import argparse
 import logging
@@ -51,6 +51,7 @@ def main() -> None:
         "--provinces",
         help=f"provincias de motordil separadas por coma (default: todas). Opciones: {', '.join(MOTORDIL_PROVINCE_SLUGS)}",
     )
+    parser.add_argument("--v6-limit", type=int, help="máximo de publicaciones de v6 (default: todas)")
     parser.add_argument("--delay", type=float, default=1.0, help="segundos de espera entre requests")
     args = parser.parse_args()
 
@@ -65,7 +66,7 @@ def main() -> None:
     items: List[Dict[str, Any]] = []
     with make_client() as client:
         if args.site in ("v6", "all"):
-            items += scrape_v6(client, delay=args.delay)
+            items += scrape_v6(client, delay=args.delay, limit=args.v6_limit)
         if args.site in ("motordil", "all"):
             items += scrape_motordil(client, slugs, max_pages=args.pages, delay=args.delay)
 

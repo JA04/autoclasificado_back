@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 MOTORDIL_BASE_URL = "https://www.motordil.com"
 V6_BASE_URL = "https://v6.com.ar"
 V6_LISTING_URL = "https://www.v6.com.ar/autos-usados"
+V6_SITEMAP_URL = "https://v6.com.ar/sitemap.xml"
 
 # motordil.com/autos no lista autos: es un índice. Las publicaciones están en
 # /autos/usados/{provincia}, paginadas con ?page=N.
@@ -55,6 +56,8 @@ USER_AGENT = "autoclasificado/1.0 (agregador de clasificados de autos usados)"
 PRICE_RE = re.compile(r"(?:USD|U\$S|US\$|ARS|\$)\s*[\d.,]+", re.IGNORECASE)
 MILEAGE_RE = re.compile(r"([\d.,]+)\s*kms?\b", re.IGNORECASE)
 LEADING_YEAR_RE = re.compile(r"^((?:19|20)\d{2})\b\s*(.*)$", re.DOTALL)
+NEXT_PUSH_RE = re.compile(r"self\.__next_f\.push\((\[.*\])\)\s*;?\s*$", re.DOTALL)
+SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>")
 PAGE_COUNT_RE = re.compile(r"\d+\s+de\s+(\d+)")
 
 
@@ -72,13 +75,26 @@ def clean_price(text: Optional[str]) -> Tuple[Optional[int], str]:
     if not text:
         return None, "USD"
     upper = text.upper()
+    amount = clean_number(text)
     if any(prefix in upper for prefix in ("USD", "U$S", "US$")):
         currency = "USD"
     elif "ARS" in upper or "$" in upper:
         currency = "ARS"
     else:
-        currency = "USD"
-    return clean_number(text), currency
+        currency = infer_currency(amount)
+    return amount, currency
+
+
+# Cuando una publicación no aclara la moneda: nadie vende un auto a menos de
+# un millón de pesos ni a más de un millón de dólares.
+ARS_MIN_AMOUNT = 1_000_000
+
+
+def infer_currency(amount: Optional[int]) -> str:
+    """Deduce la moneda por el monto: menos de 1.000.000 es USD; desde ahí, ARS."""
+    if amount is not None and amount >= ARS_MIN_AMOUNT:
+        return "ARS"
+    return "USD"
 
 
 def split_year(text: str) -> Tuple[Optional[int], str]:
@@ -158,6 +174,16 @@ def parse_motordil_page_count(html: str) -> int:
 
 
 # --- V6 ---
+def v6_canonical_url(url: str) -> str:
+    """Lleva la URL de una publicación de v6 a una forma única: /auto/{id}.
+
+    v6 identifica la publicación por el id del final ('fiat-titano-2026-PBfN31yK4Z') e
+    ignora el resto, así que el mismo auto aparece con textos distintos según la página.
+    """
+    uid = url.rstrip("/").rsplit("/", 1)[-1].rsplit("-", 1)[-1]
+    return f"{V6_BASE_URL}/auto/{uid}"
+
+
 def parse_v6_item(item: Tag) -> Optional[Dict[str, Any]]:
     """Parsea un <li> del listado de v6.com.ar.
 
@@ -184,7 +210,6 @@ def parse_v6_item(item: Tag) -> Optional[Dict[str, Any]]:
         elif part:
             location = part
 
-    href = link["href"]
     return {
         "title": title,
         "year": year,
@@ -193,7 +218,7 @@ def parse_v6_item(item: Tag) -> Optional[Dict[str, Any]]:
         "currency": currency,
         # El listado muestra la localidad; solo sirve si coincide con una provincia
         "province": find_province(location),
-        "original_url": f"{V6_BASE_URL}{href}" if href.startswith("/") else href,
+        "original_url": v6_canonical_url(link["href"]),
         "source_site": "v6",
     }
 
@@ -205,19 +230,95 @@ def parse_v6_listing(html: str) -> List[Dict[str, Any]]:
     return [item for item in items if item is not None]
 
 
-def parse_v6_detail_province(html: str) -> Optional[str]:
-    """Obtiene la provincia de la página de una publicación de v6 (datos schema.org)."""
-    soup = BeautifulSoup(html, "html.parser")
+def parse_v6_sitemap(xml: str) -> List[str]:
+    """Extrae del sitemap de v6 las URLs de publicaciones (/auto/...)."""
+    urls = [url for url in SITEMAP_LOC_RE.findall(xml) if "/auto/" in url]
+    return list(dict.fromkeys(urls))
+
+
+def _v6_structured_car(soup: BeautifulSoup) -> Dict[str, Any]:
+    """Datos schema.org (ld+json) de la publicación, o {} si no están."""
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
-            if data.get("@type") != "Car":
-                continue
-            region = data["availableAtOrFrom"]["address"]["addressRegion"]
-        except (ValueError, AttributeError, KeyError, TypeError):
+        except ValueError:
             continue
-        return normalize_province(region)
-    return None
+        if isinstance(data, dict) and data.get("@type") == "Car":
+            return data
+    return {}
+
+
+def _v6_vehicle(soup: BeautifulSoup) -> Dict[str, Any]:
+    """Objeto `initialVehicle` que la página de v6 le pasa a su app, o {} si no está."""
+    marker = '"initialVehicle":'
+    for script in soup.find_all("script"):
+        match = NEXT_PUSH_RE.match((script.string or "").strip())
+        if not match:
+            continue
+        try:
+            chunk = json.loads(match.group(1))[1]
+            position = chunk.index(marker) + len(marker)
+            vehicle, _ = json.JSONDecoder().raw_decode(chunk, position)
+        except (ValueError, IndexError, TypeError, AttributeError):
+            continue
+        if isinstance(vehicle, dict):
+            return vehicle
+    return {}
+
+
+def _dig(data: Any, *keys: str) -> Any:
+    for key in keys:
+        data = data.get(key) if isinstance(data, dict) else None
+    return data
+
+
+def _as_int(value: Any) -> Optional[int]:
+    return clean_number(str(value)) if value not in (None, "") else None
+
+
+def parse_v6_detail(html: str, url: str) -> Optional[Dict[str, Any]]:
+    """Parsea la página de una publicación de v6.com.ar.
+
+    Lee los datos que la página le pasa a su app (`initialVehicle`) y, si faltan, los
+    de schema.org. La moneda de schema.org no es confiable (siempre dice ARS): cuando
+    la publicación no trae la suya, se deduce por el monto.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    vehicle = _v6_vehicle(soup)
+    structured = _v6_structured_car(soup)
+    if vehicle.get("active") is False:
+        return None
+
+    name = " ".join(str(vehicle[key]) for key in ("brand", "model", "version") if vehicle.get(key))
+    year = _as_int(vehicle.get("year"))
+    if not name:
+        year, name = split_year(str(structured.get("name") or ""))
+    if not name:
+        return None
+
+    price = _as_int(vehicle.get("price"))
+    if price is None:
+        price = _as_int(_dig(structured, "offers", "price"))
+    mileage = _as_int(vehicle.get("kilometers"))
+    if mileage is None:
+        mileage = _as_int(_dig(structured, "mileageFromOdometer", "value"))
+    currency = vehicle.get("currency")
+    if currency not in ("USD", "ARS"):
+        currency = infer_currency(price)
+    province = normalize_province(vehicle.get("province")) or normalize_province(
+        _dig(structured, "availableAtOrFrom", "address", "addressRegion")
+    )
+
+    return {
+        "title": " ".join(name.split()),
+        "year": year or _as_int(structured.get("vehicleModelDate")),
+        "mileage": mileage,
+        "price": price,
+        "currency": currency,
+        "province": province,
+        "original_url": v6_canonical_url(url),
+        "source_site": "v6",
+    }
 
 
 # --- REQUESTS ---
@@ -268,8 +369,30 @@ def scrape_motordil(
     return items
 
 
-def scrape_v6(client: httpx.Client, delay: float = 1.0) -> List[Dict[str, Any]]:
-    """Lee el listado de v6.com.ar y completa la provincia desde cada publicación."""
+def scrape_v6(client: httpx.Client, delay: float = 1.0, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Recorre las publicaciones del sitemap de v6.com.ar (hasta `limit`, si se indica).
+
+    Si el sitemap no está disponible, usa el listado de /autos-usados, que trae menos.
+    """
+    sitemap = fetch_html(client, V6_SITEMAP_URL)
+    urls = parse_v6_sitemap(sitemap) if sitemap else []
+    if not urls:
+        logger.warning("v6: sin sitemap, se usa el listado de /autos-usados")
+        return scrape_v6_listing(client, delay)
+
+    urls = urls[:limit] if limit is not None else urls
+    items: List[Dict[str, Any]] = []
+    for url in urls:
+        html = fetch_html(client, url, delay)
+        item = parse_v6_detail(html, url) if html is not None else None
+        if item is not None:
+            items.append(item)
+    logger.info("v6: %d publicaciones leídas de %d del sitemap", len(items), len(urls))
+    return items
+
+
+def scrape_v6_listing(client: httpx.Client, delay: float = 1.0) -> List[Dict[str, Any]]:
+    """Lee el listado de /autos-usados y completa la provincia desde cada publicación."""
     html = fetch_html(client, V6_LISTING_URL)
     if html is None:
         return []
@@ -277,7 +400,8 @@ def scrape_v6(client: httpx.Client, delay: float = 1.0) -> List[Dict[str, Any]]:
     logger.info("v6 listado: %d publicaciones", len(items))
     for item in items:
         if item["province"] is None:
-            detail = fetch_html(client, item["original_url"], delay)
+            detail_html = fetch_html(client, item["original_url"], delay)
+            detail = parse_v6_detail(detail_html, item["original_url"]) if detail_html is not None else None
             if detail is not None:
-                item["province"] = parse_v6_detail_province(detail)
+                item["province"] = detail["province"]
     return items
