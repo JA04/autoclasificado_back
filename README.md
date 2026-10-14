@@ -1,8 +1,8 @@
 # Autoclasificado — backend
 
 API de un agregador de autos usados. Junta publicaciones de
-[motordil.com](https://www.motordil.com) y [v6.com.ar](https://www.v6.com.ar),
-las guarda en SQLite y las expone en un único endpoint, `GET /cars`.
+[motordil.com](https://www.motordil.com), [v6.com.ar](https://www.v6.com.ar) y
+[MercadoLibre](https://autos.mercadolibre.com.ar), las guarda en SQLite y las expone en un único endpoint, `GET /cars`.
 
 Stack: FastAPI, SQLAlchemy 2, SQLite, httpx + BeautifulSoup, Pytest.
 
@@ -84,6 +84,7 @@ make scrape                                        # todo, 1 página por provinc
 make scrape ARGS="--pages 3"                       # hasta 3 páginas por provincia en motordil
 make scrape ARGS="--site motordil --provinces cordoba,santa-fe"
 make scrape ARGS="--site v6 --v6-limit 20"         # solo v6, primeras 20 publicaciones
+make scrape ARGS="--site mercadolibre"             # solo MercadoLibre (1 request)
 ```
 
 Se puede correr todas las veces que haga falta: las publicaciones se identifican por
@@ -106,6 +107,14 @@ responde, se usa el listado de `/autos-usados`.
 v6 identifica cada publicación por el id del final de la URL e ignora el resto, así
 que se guarda siempre la forma `https://v6.com.ar/auto/{id}`.
 
+**mercadolibre** — se lee solo la primera página de autos usados de todo el país: 48
+publicaciones en un request. Su `robots.txt` no permite recorrer las páginas
+siguientes, así que es una muestra de lo más reciente y no el catálogo (unas 90.000
+publicaciones). Como el orden cambia, cada corrida suele traer autos nuevos. La
+provincia sale de la zona (`Avellaneda - Bs.As. G.B.A. Sur` → Buenos Aires) y el año
+se saca del título. Se guarda la forma `https://auto.mercadolibre.com.ar/MLA-{id}-_JM`,
+sin el título ni los datos de seguimiento del link.
+
 ### Moneda
 
 Cuando la publicación dice la moneda (`USD`, `U$S`, `ARS`, `$`), se respeta. Cuando no
@@ -115,8 +124,8 @@ para esto porque declaran `ARS` siempre, incluso en autos publicados en dólares
 
 ### Limitaciones conocidas
 
-- **Una corrida completa tarda unos 6 minutos**: son ~180 requests a v6 y 24 a
-  motordil, con 1 segundo de espera entre cada uno.
+- **Una corrida completa tarda unos 6 minutos**: son ~180 requests a v6, 24 a
+  motordil y 1 a MercadoLibre, con 1 segundo de espera entre cada uno.
 - **motordil pesa ~2 MB por página.** Con `--pages 1` son 24 requests; Buenos Aires
   tiene más de 100 páginas, así que conviene subir `--pages` de a poco.
 - Las publicaciones que desaparecen de los portales no se borran de `cars.db`.

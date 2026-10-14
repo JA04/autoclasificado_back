@@ -10,6 +10,10 @@ import pytest
 from app.ingest import upsert_cars
 from app.models import Car
 from app.scraper import (
+    MERCADOLIBRE_LISTING_URL,
+    mercadolibre_canonical_url,
+    parse_mercadolibre_listing,
+    scrape_mercadolibre,
     V6_LISTING_URL,
     V6_SITEMAP_URL,
     clean_number,
@@ -294,6 +298,103 @@ def test_scrape_v6_falls_back_to_listing_without_sitemap():
 
 def test_scrape_v6_returns_empty_when_site_is_down():
     assert scrape_v6(mock_client(lambda request: httpx.Response(500)), delay=0) == []
+
+
+# --- MERCADOLIBRE ---
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://auto.mercadolibre.com.ar/MLA-4064104666-volkswagen-crossfox-16-comfortline-_JM",
+        "https://auto.mercadolibre.com.ar/MLA-4064104666-otro-titulo-_JM#polycard_client=search&position=1",
+        "https://auto.mercadolibre.com.ar/MLA-4064104666-_JM",
+    ],
+)
+def test_mercadolibre_canonical_url(url):
+    assert mercadolibre_canonical_url(url) == "https://auto.mercadolibre.com.ar/MLA-4064104666-_JM"
+
+
+def test_mercadolibre_canonical_url_without_id():
+    assert mercadolibre_canonical_url("https://click1.mercadolibre.com.ar/mclics/clicks/external") is None
+
+
+def test_parse_mercadolibre_listing():
+    cars = parse_mercadolibre_listing(fixture("mercadolibre_listing.html"))
+
+    assert len(cars) == 4
+    # Precio en pesos, zona del conurbano, año fuera del título
+    assert cars[0] == {
+        "title": "Volkswagen Crossfox 1.6 Comfortline",
+        "year": 2012,
+        "mileage": 137000,
+        "price": 12500000,
+        "currency": "ARS",
+        "province": "Buenos Aires",
+        "original_url": "https://auto.mercadolibre.com.ar/MLA-4064104666-_JM",
+        "source_site": "mercadolibre",
+    }
+    # Precio en dólares
+    assert (cars[1]["title"], cars[1]["price"], cars[1]["currency"]) == ("Audi A1 1.0 Tfsi", 24000, "USD")
+    assert [car["province"] for car in cars] == ["Buenos Aires", "Buenos Aires", "Capital Federal", "Córdoba"]
+    assert all(car["source_site"] == "mercadolibre" for car in cars)
+
+
+def mercadolibre_card(title_link: str, extra: str = "") -> str:
+    return f'<div class="poly-card">{title_link}{extra}</div>'
+
+
+def test_parse_mercadolibre_listing_tolerates_missing_data():
+    html = mercadolibre_card(
+        '<a class="poly-component__title" href="https://auto.mercadolibre.com.ar/MLA-1-fiat-uno-_JM">Fiat Uno</a>'
+    )
+
+    assert parse_mercadolibre_listing(html) == [
+        {
+            "title": "Fiat Uno",
+            "year": None,
+            "mileage": None,
+            "price": None,
+            "currency": "USD",
+            "province": None,
+            "original_url": "https://auto.mercadolibre.com.ar/MLA-1-_JM",
+            "source_site": "mercadolibre",
+        }
+    ]
+
+
+def test_parse_mercadolibre_listing_keeps_model_named_like_a_year():
+    # Solo se saca del título el año de la publicación, una vez
+    html = mercadolibre_card(
+        '<a class="poly-component__title" href="https://auto.mercadolibre.com.ar/MLA-2-x-_JM">Peugeot 2008 2020 1.6 Feline</a>',
+        '<ul><li class="poly-attributes_list__item">2020</li><li class="poly-attributes_list__item">40.000 Km</li></ul>',
+    )
+
+    car = parse_mercadolibre_listing(html)[0]
+
+    assert (car["title"], car["year"], car["mileage"]) == ("Peugeot 2008 1.6 Feline", 2020, 40000)
+
+
+def test_parse_mercadolibre_listing_skips_cards_without_listing_id():
+    html = mercadolibre_card('<a class="poly-component__title" href="https://click1.mercadolibre.com.ar/x">Aviso</a>')
+
+    assert parse_mercadolibre_listing(html) == []
+
+
+def test_scrape_mercadolibre_reads_only_the_first_page():
+    requested = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(200, text=fixture("mercadolibre_listing.html"))
+
+    cars = scrape_mercadolibre(mock_client(handler))
+
+    assert len(cars) == 4
+    assert len(requested) == 1
+    assert httpx.URL(requested[0]) == httpx.URL(MERCADOLIBRE_LISTING_URL)
+
+
+def test_scrape_mercadolibre_returns_empty_when_site_is_down():
+    assert scrape_mercadolibre(mock_client(lambda request: httpx.Response(500))) == []
 
 
 # --- INGESTA ---

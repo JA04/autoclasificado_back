@@ -21,6 +21,10 @@ MOTORDIL_BASE_URL = "https://www.motordil.com"
 V6_BASE_URL = "https://v6.com.ar"
 V6_LISTING_URL = "https://www.v6.com.ar/autos-usados"
 V6_SITEMAP_URL = "https://v6.com.ar/sitemap.xml"
+MERCADOLIBRE_ITEM_BASE_URL = "https://auto.mercadolibre.com.ar"
+# Autos usados de todo el país. Solo se lee la primera página: el robots.txt de
+# MercadoLibre no permite recorrer las siguientes.
+MERCADOLIBRE_LISTING_URL = "https://autos.mercadolibre.com.ar/_ITEM*CONDITION_2230581"
 
 # motordil.com/autos no lista autos: es un índice. Las publicaciones están en
 # /autos/usados/{provincia}, paginadas con ?page=N.
@@ -59,6 +63,8 @@ LEADING_YEAR_RE = re.compile(r"^((?:19|20)\d{2})\b\s*(.*)$", re.DOTALL)
 NEXT_PUSH_RE = re.compile(r"self\.__next_f\.push\((\[.*\])\)\s*;?\s*$", re.DOTALL)
 SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>")
 PAGE_COUNT_RE = re.compile(r"\d+\s+de\s+(\d+)")
+MERCADOLIBRE_ID_RE = re.compile(r"/(MLA-\d+)")
+YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 
 
 # --- LIMPIEZA ---
@@ -321,6 +327,72 @@ def parse_v6_detail(html: str, url: str) -> Optional[Dict[str, Any]]:
     }
 
 
+# --- MERCADOLIBRE ---
+def mercadolibre_canonical_url(url: str) -> Optional[str]:
+    """Lleva el link de una publicación de MercadoLibre a una forma única: /MLA-{id}-_JM.
+
+    El link del listado trae el título y datos de seguimiento ('#polycard_client=...')
+    que cambian en cada visita; MercadoLibre solo usa el id. Sin id, devuelve None.
+    """
+    match = MERCADOLIBRE_ID_RE.search(url)
+    if not match:
+        return None
+    return f"{MERCADOLIBRE_ITEM_BASE_URL}/{match.group(1)}-_JM"
+
+
+def parse_mercadolibre_card(card: Tag) -> Optional[Dict[str, Any]]:
+    """Parsea la card (.poly-card) de una publicación del listado de MercadoLibre."""
+    link = card.select_one("a.poly-component__title")
+    if link is None:
+        return None
+    url = mercadolibre_canonical_url(link.get("href") or "")
+    title = _text(link)
+    if url is None or not title:
+        return None
+
+    # Los atributos vienen sueltos: '2012' y '137.000 Km'
+    year, mileage = None, None
+    for attribute in card.select(".poly-attributes_list__item"):
+        text = _text(attribute)
+        mileage_match = MILEAGE_RE.search(text)
+        if mileage_match:
+            mileage = clean_number(mileage_match.group(1))
+        elif YEAR_RE.fullmatch(text):
+            year = int(text)
+
+    # El título repite el año ('Volkswagen Crossfox 2012 1.6'): lo sacamos
+    if year is not None:
+        title = " ".join(re.sub(rf"\b{year}\b", "", title, count=1).split()) or title
+
+    price, currency = None, "USD"
+    symbol = card.select_one(".poly-price__current .andes-money-amount__currency-symbol")
+    amount = card.select_one(".poly-price__current .andes-money-amount__fraction")
+    if amount is not None:
+        price, currency = clean_price(f"{_text(symbol) if symbol is not None else ''} {_text(amount)}")
+
+    # La ubicación viene como 'Avellaneda - Bs.As. G.B.A. Sur': ciudad y zona
+    location = card.select_one(".poly-component__location")
+    zone = _text(location).rsplit(" - ", 1)[-1] if location is not None else None
+
+    return {
+        "title": title,
+        "year": year,
+        "mileage": mileage,
+        "price": price,
+        "currency": currency,
+        "province": find_province(zone),
+        "original_url": url,
+        "source_site": "mercadolibre",
+    }
+
+
+def parse_mercadolibre_listing(html: str) -> List[Dict[str, Any]]:
+    """Parsea una página de resultados de autos.mercadolibre.com.ar."""
+    soup = BeautifulSoup(html, "html.parser")
+    items = (parse_mercadolibre_card(card) for card in soup.select(".poly-card"))
+    return [item for item in items if item is not None]
+
+
 # --- REQUESTS ---
 def make_client() -> httpx.Client:
     return httpx.Client(
@@ -404,4 +476,14 @@ def scrape_v6_listing(client: httpx.Client, delay: float = 1.0) -> List[Dict[str
             detail = parse_v6_detail(detail_html, item["original_url"]) if detail_html is not None else None
             if detail is not None:
                 item["province"] = detail["province"]
+    return items
+
+
+def scrape_mercadolibre(client: httpx.Client) -> List[Dict[str, Any]]:
+    """Lee la primera página de autos usados de MercadoLibre (48 publicaciones)."""
+    html = fetch_html(client, MERCADOLIBRE_LISTING_URL)
+    if html is None:
+        return []
+    items = parse_mercadolibre_listing(html)
+    logger.info("mercadolibre: %d publicaciones", len(items))
     return items

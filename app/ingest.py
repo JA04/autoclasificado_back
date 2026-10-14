@@ -1,7 +1,7 @@
 """
 Ingesta: descarga las publicaciones de los portales y las guarda en la base de datos.
 
-Uso: python -m app.ingest [--site motordil|v6|all] [--pages N] [--provinces slug1,slug2] [--v6-limit N]
+Uso: python -m app.ingest [--site motordil|v6|mercadolibre|all] [--pages N] [--provinces slug1,slug2] [--v6-limit N]
 """
 import argparse
 import logging
@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.database import Base, SessionLocal, engine
 from app.models import Car
-from app.scraper import MOTORDIL_PROVINCE_SLUGS, make_client, scrape_motordil, scrape_v6
+from app.scraper import MOTORDIL_PROVINCE_SLUGS, make_client, scrape_mercadolibre, scrape_motordil, scrape_v6
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def upsert_cars(db: Session, items: Iterable[Dict[str, Any]]) -> Tuple[int, int]
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Descarga publicaciones y las guarda en cars.db")
-    parser.add_argument("--site", choices=["motordil", "v6", "all"], default="all")
+    parser.add_argument("--site", choices=["motordil", "v6", "mercadolibre", "all"], default="all")
     parser.add_argument("--pages", type=int, default=1, help="páginas por provincia en motordil (24 autos c/u)")
     parser.add_argument(
         "--provinces",
@@ -69,6 +69,8 @@ def main() -> None:
             items += scrape_v6(client, delay=args.delay, limit=args.v6_limit)
         if args.site in ("motordil", "all"):
             items += scrape_motordil(client, slugs, max_pages=args.pages, delay=args.delay)
+        if args.site in ("mercadolibre", "all"):
+            items += scrape_mercadolibre(client)
 
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
